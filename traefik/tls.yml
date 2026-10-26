@@ -1,0 +1,4 @@
+tls:
+  certificates:
+    - certFile: /certs/dms.dev.pem
+      keyFile: /certs/dms.dev-key.pem

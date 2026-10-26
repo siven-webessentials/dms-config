@@ -1,0 +1,188 @@
+name: dms
+
+networks:
+  dms-net:
+    name: dms-net
+
+volumes:
+  mariadb_data:
+  keycloak_db_data:
+  webclient_node_modules:
+  webclient_next:
+
+services:
+  traefik:
+    image: ${TRAEFIK_IMAGE}
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=dms-net
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik:/etc/traefik/dynamic:ro
+      - ./certs:/certs:ro
+    networks:
+      - dms-net
+
+  mariadb:
+    image: ${MARIADB_IMAGE}
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${CORE_DB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${CORE_DB_DATABASE}
+      MARIADB_USER: ${CORE_DB_USERNAME}
+      MARIADB_PASSWORD: ${CORE_DB_PASSWORD}
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - dms-net
+
+  keycloak-db:
+    image: ${MARIADB_IMAGE}
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${KC_DB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${KC_DB_NAME}
+      MARIADB_USER: ${KC_DB_USER}
+      MARIADB_PASSWORD: ${KC_DB_PASSWORD}
+    volumes:
+      - keycloak_db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - dms-net
+
+  adminer:
+    image: adminer:5
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: mariadb
+    depends_on:
+      - mariadb
+      - keycloak-db
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.adminer.rule=Host(`${ADMINER_HOST}`)
+      - traefik.http.routers.adminer.entrypoints=websecure
+      - traefik.http.routers.adminer.tls=true
+      - traefik.http.services.adminer.loadbalancer.server.port=8080
+    networks:
+      - dms-net
+
+  keycloak:
+    image: ${KEYCLOAK_IMAGE}
+    restart: unless-stopped
+    command: start-dev
+    environment:
+      KC_DB: mariadb
+      KC_DB_URL_HOST: keycloak-db
+      KC_DB_URL_DATABASE: ${KC_DB_NAME}
+      KC_DB_USERNAME: ${KC_DB_USER}
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD}
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KC_HOSTNAME: https://${KEYCLOAK_HOST}
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY_HEADERS: xforwarded
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.keycloak.rule=Host(`${KEYCLOAK_HOST}`)
+      - traefik.http.routers.keycloak.entrypoints=websecure
+      - traefik.http.routers.keycloak.tls=true
+      - traefik.http.services.keycloak.loadbalancer.server.port=8080
+    networks:
+      - dms-net
+
+  keycloak-config-cli:
+    image: ${KEYCLOAK_CONFIG_CLI_IMAGE}
+    restart: "no"
+    environment:
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_USER: ${KEYCLOAK_ADMIN}
+      KEYCLOAK_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KEYCLOAK_AVAILABILITYCHECK_ENABLED: "true"
+      KEYCLOAK_AVAILABILITYCHECK_TIMEOUT: 180s
+      IMPORT_FILES_LOCATIONS: /config/*.json
+    volumes:
+      - ./keycloak:/config:ro
+    depends_on:
+      - keycloak
+    networks:
+      - dms-net
+
+  dms-core:
+    image: serversideup/php:8.4-cli
+    working_dir: /app
+    restart: unless-stopped
+    user: "${LOCAL_UID}:${LOCAL_GID}"
+    command: sh -c "composer install --no-interaction && php artisan serve --host=0.0.0.0 --port=8000 --no-reload"
+    environment:
+      HOME: /tmp
+      COMPOSER_HOME: /tmp/composer
+      PHP_OPCACHE_ENABLE: "0"
+      PHP_CLI_SERVER_WORKERS: "4"
+      APP_ENV: local
+      APP_DEBUG: "true"
+      APP_URL: https://${HOST_NAME}
+      DB_CONNECTION: mariadb
+      DB_HOST: mariadb
+      DB_PORT: "3306"
+      DB_DATABASE: ${CORE_DB_DATABASE}
+      DB_USERNAME: ${CORE_DB_USERNAME}
+      DB_PASSWORD: ${CORE_DB_PASSWORD}
+    volumes:
+      - ../dms-core:/app
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.core.rule=Host(`${HOST_NAME}`) && PathPrefix(`/api`)
+      - traefik.http.routers.core.entrypoints=websecure
+      - traefik.http.routers.core.tls=true
+      - traefik.http.routers.core.priority=10
+      - traefik.http.services.core.loadbalancer.server.port=8000
+    networks:
+      - dms-net
+
+  dms-webclient:
+    image: node:24-alpine
+    working_dir: /app
+    restart: unless-stopped
+    command: sh -c "corepack enable && corepack prepare pnpm@latest --activate && pnpm install && pnpm dev"
+    environment:
+      NEXT_PUBLIC_KEYCLOAK_URL: https://${KEYCLOAK_HOST}
+    volumes:
+      - ../dms-webclient:/app
+      - webclient_node_modules:/app/node_modules
+      - webclient_next:/app/.next
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.web.rule=Host(`${HOST_NAME}`)
+      - traefik.http.routers.web.entrypoints=websecure
+      - traefik.http.routers.web.tls=true
+      - traefik.http.routers.web.priority=1
+      - traefik.http.services.web.loadbalancer.server.port=3000
+    networks:
+      - dms-net
